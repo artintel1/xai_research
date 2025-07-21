@@ -10,12 +10,13 @@ class MoEModel(nn.Module):
     (experts), a lightweight gating network to combine their outputs, and a
     classification head.
     """
-    def __init__(self, num_classes: int, temporal_sampling_rates: tuple = (1, 2, 4, 8)):
+    def __init__(self, num_classes: int, temporal_sampling_rates: tuple = (1, 2, 4, 8), dropout_prob: float = 0.5):
         """
         Args:
             num_classes (int): The number of action classes.
             temporal_sampling_rates (tuple): A tuple of integers representing
                                              the 'drop' rates for each temporal expert.
+            dropout_prob (float): The probability for the dropout layer.
         """
         super().__init__()
         self.temporal_sampling_rates = temporal_sampling_rates
@@ -38,7 +39,10 @@ class MoEModel(nn.Module):
         )
 
         # 3. Aggregation and Classification Head
-        self.classifier_head = nn.Linear(self.feature_size, num_classes)
+        self.classifier_head = nn.Sequential(
+            nn.Dropout(p=dropout_prob),
+            nn.Linear(self.feature_size, num_classes)
+        )
 
     def forward(self, expert_clips: dict):
         """

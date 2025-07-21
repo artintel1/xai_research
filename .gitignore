@@ -85,7 +85,7 @@ data
 runs/
 logs/
 checkpoints/
-
+outputs/
 # Decord cache (if created)
 .decord/
 

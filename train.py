@@ -174,11 +174,20 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--lambda_lb", type=float, default=0.01,
                         help="Coefficient for the load balancing loss.")
+    parser.add_argument("--weight_decay", type=float, default=1e-5,
+                        help="Weight decay (L2 penalty) for the optimizer.")
+    parser.add_argument("--dropout_prob", type=float, default=0.5,
+                        help="Dropout probability for the classifier head.")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of data loading workers.")
+    parser.add_argument("--save_dir", type=str, default="checkpoints",
+                        help="Directory to save model checkpoints.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device to use for training (cuda or cpu).")
     args = parser.parse_args()
+
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
 
     print(f"Using device: {args.device}")
 
@@ -213,11 +222,20 @@ def main():
     print(f"Number of classes: {num_classes}")
 
     # Model, Loss, Optimizer
-    model = MoEModel(num_classes=num_classes, temporal_sampling_rates=tuple(args.sampling_rates)).to(args.device)
+    model = MoEModel(
+        num_classes=num_classes,
+        temporal_sampling_rates=tuple(args.sampling_rates),
+        dropout_prob=args.dropout_prob
+    ).to(args.device)
     criterion_cls = nn.CrossEntropyLoss()
     # For load balancing loss, we defined a helper function
     criterion_lb = calculate_load_balancing_loss # Using the helper function directly
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    best_val_accuracy = -1.0
+    best_model_path = os.path.join(args.save_dir, "best_model.pth")
+    final_model_path = os.path.join(args.save_dir, "final_model.pth")
+
 
     print("Starting training...")
     for epoch in range(1, args.num_epochs + 1):
@@ -232,7 +250,15 @@ def main():
         print(f"  Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, LB: {train_lb_loss:.4f}) | Train Acc: {train_accuracy:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.4f}")
 
-    print("Training complete!")
+        # Save best model based on validation accuracy
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            torch.save(model.state_dict(), best_model_path)
+            print(f"  Saved best model with Val Acc: {best_val_accuracy:.4f} to {best_model_path}")
+
+    # Save the final model
+    torch.save(model.state_dict(), final_model_path)
+    print(f"Training complete! Final model saved to {final_model_path}")
 
 if __name__ == "__main__":
     main()
