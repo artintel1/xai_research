@@ -77,7 +77,7 @@ myenv/
 references/
 *.ipynb
 architecture_and_training_plan.md
-data
+dataset
 # Model Checkpoints and Logs
 *.pt
 *.pth
