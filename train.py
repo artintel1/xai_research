@@ -1,127 +1,75 @@
+import os
+import argparse
+import yaml
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from tqdm import tqdm
-import argparse
-import os
 
-# Assuming these are available in the project structure
+# Assuming your project structure is project_xai/train.py, project_xai/src/...
 from src.data.dataset import VideoDataset
 from src.models.model import MoEModel
 
-def calculate_load_balancing_loss(gating_weights, expert_outputs, num_experts):
+
+def calculate_load_balancing_loss(gating_weights, num_experts):
     """
     Calculates the auxiliary load balancing loss for MoE.
     Encourages experts to be used somewhat evenly.
 
     Args:
         gating_weights (torch.Tensor): Tensor of gating weights (batch_size, num_experts).
-        expert_outputs (torch.Tensor): Features produced by experts (batch_size, num_experts, feature_size).
         num_experts (int): Total number of experts.
 
     Returns:
-        torch.Tensor: The scalar load balancing loss.
+        torch.Tensor: The scalar load balancing loss (variance of average gate values).
     """
-    # Sum of gating weights per expert across the batch: (num_experts,)
-    # This represents how much each expert is "activated"
-    expert_load = gating_weights.sum(dim=0) # (num_experts,)
-
-    # Mean of expert outputs across the batch (not directly used for this type of load balancing)
-    # This is more for a 'importance' balancing, not just usage balancing
-    # For a simple load balancing loss, we want to ensure expert_load is evenly distributed.
-
-    # We want expert_load to be close to batch_size / num_experts for each expert.
-    # A common formulation involves the variance or simply
-    # (sum_i p_i x_i) - (sum_i p_i)(sum_i x_i) or similar, where p_i are probabilities.
-
-    # A simpler approach is to encourage the variance of expert_load to be low.
-    # Or, as in some MoE papers, promote (sum_i g_i) * (sum_i (g_i)^2)
-
-    # Let's use a simpler version: penalize if sum(p_i)^2 != N * sum(p_i * x_i)
-    # A more standard one from actual MoE papers:
-    # (sum_i expert_gating_sum_for_batch[i]) * (sum_i expert_output_mean_for_batch[i])
-
-    # Let's use the method from "Outrageously Large Neural Networks" (Shazeer et al. 2017)
-    # Loss = sum_{i=1 to N} (P_i * M_i)
-    # Where P_i is the fraction of total samples routed to expert i, and M_i is the mean output magnitude.
-    # Or, a simpler formulation: (sum_i mean_gating_weights_for_expert_i) * (sum_i mean_expert_feature_norm_for_expert_i)
-
-    # Let's stick to the simpler one that encourages equal usage:
-    # A common way is to make sure the mean gating weight for each expert is similar.
-    # This can be approximated by minimizing the covariance between dispatching and expert usage.
-
-    # Simpler version: variance of expert_load
-    load_balancing_loss = torch.var(expert_load)
-
-    # Another common form:
-    # From "GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding"
-    # L_balance = Sum_i (P_i * F_i) where P_i = sum_k gating_weights[k,i] and F_i = sum_k I(expert_k is top1_for_input_k)
-    # This might be too complex for simple implementation.
-
-    # A more direct load balancing from "Outrageously Large Neural Networks":
-    # Loss = sum_{experts} sum_{batch_elements} gating_weight[expert] * (expert_output * 1.0 / (number_of_times_expert_is_chosen))
-    # This implies knowledge of which expert is chosen, which is for sparse MoE.
-
-    # For dense MoE where all experts are always "chosen" to some degree,
-    # a simpler balancing loss could be to penalize the squared difference from uniform distribution.
-    # Or, directly from the paper: `loss += (load * importance).sum()`
-    # where load is sum(gating_weight) for expert, and importance is expert_output_mean_norm.
-
-    # Let's use the simplest, most direct one that encourages all experts to have non-zero average weight:
-    # sum (p_i)^2 where p_i is average probability for expert i
-    avg_gating_weights = gating_weights.mean(dim=0) # (num_experts,)
-    load_balancing_loss = (avg_gating_weights * avg_gating_weights).sum() * num_experts # Penalize small sums
-    # Or, simply minimize the entropy of avg_gating_weights
-    # Or, maximize the entropy of avg_gating_weights, or make them uniform.
-
-    # For this implementation, let's target equal average usage per expert.
-    # Penalize the deviation of each expert's average gate value from the overall average.
-    # (batch_size * num_experts) * Sum_i (Avg(g_i) - 1/num_experts)^2
-    # The sum of all gating weights for a batch / batch size should be 1.0.
-    # So avg_gating_weights should be close to 1.0 / num_experts for each expert.
-    # We want to minimize the variance of `avg_gating_weights`.
+    if gating_weights is None or gating_weights.numel() == 0:
+        return torch.tensor(0.0, device=gating_weights.device)
+    # Average gating weight per expert across the batch
+    avg_gating_weights = gating_weights.mean(dim=0)
+    # Penalize the variance of these average gating weights to encourage uniform usage.
     load_balancing_loss = avg_gating_weights.var()
-
     return load_balancing_loss
 
 
-def train(model, dataloader, criterion_cls, criterion_lb, optimizer, device, lambda_lb):
+def train(model, dataloader, criterion_cls, criterion_lb_func, optimizer, device, cfg):
     model.train()
     total_loss = 0.0
     total_cls_loss = 0.0
-    total_lb_loss = 0.0
+    total_spatial_lb_loss = 0.0
+    total_temporal_lb_loss = 0.0
     correct_predictions = 0
     total_samples = 0
 
-    for expert_clips, labels in tqdm(dataloader, desc="Training"):
-        expert_clips_on_device = {k: v.to(device) for k, v in expert_clips.items()}
+    for expert_clips_nested, labels in tqdm(dataloader, desc="Training"):
         labels = labels.to(device)
+        expert_clips_on_device = {}
+        for res_key, temporal_clips_dict in expert_clips_nested.items():
+            expert_clips_on_device[res_key] = {k: v.to(device) for k, v in temporal_clips_dict.items()}
 
         optimizer.zero_grad()
 
-        # Forward pass
-        logits, gating_weights = model(expert_clips_on_device)
+        logits, spatial_gating_weights, all_temporal_gating_weights = model(expert_clips_on_device)
 
-        # Calculate classification loss
         cls_loss = criterion_cls(logits, labels)
+        spatial_lb_loss = criterion_lb_func(spatial_gating_weights, model.num_spatial_experts)
 
-        # Calculate load balancing loss
-        # The expert_outputs (features) are needed for a more complete balancing,
-        # but for simple usage balancing, only gating_weights are needed.
-        # Here, expert_outputs are implicitly the pre-softmax outputs from the gating network.
-        # For simplicity, we'll use gating_weights only for the load balancing calculation.
-        lb_loss = calculate_load_balancing_loss(gating_weights, None, model.num_experts)
+        current_temporal_lb_loss_sum = 0.0
+        for res_key, temp_gating_weights in all_temporal_gating_weights.items():
+            current_temporal_lb_loss_sum += criterion_lb_func(temp_gating_weights, model.num_temporal_experts)
 
-        # Total loss
-        loss = cls_loss + lambda_lb * lb_loss
+        avg_temporal_lb_loss = current_temporal_lb_loss_sum / len(all_temporal_gating_weights) if all_temporal_gating_weights else torch.tensor(0.0, device=device)
+
+        loss = cls_loss + cfg['moe']['lambda_lb_spatial'] * spatial_lb_loss + cfg['moe']['lambda_lb_temporal'] * avg_temporal_lb_loss
 
         loss.backward()
         optimizer.step()
 
         total_loss += loss.item()
         total_cls_loss += cls_loss.item()
-        total_lb_loss += lb_loss.item()
+        total_spatial_lb_loss += spatial_lb_loss.item()
+        total_temporal_lb_loss += avg_temporal_lb_loss.item()
 
         _, predicted = torch.max(logits, 1)
         total_samples += labels.size(0)
@@ -129,9 +77,11 @@ def train(model, dataloader, criterion_cls, criterion_lb, optimizer, device, lam
 
     avg_loss = total_loss / len(dataloader)
     avg_cls_loss = total_cls_loss / len(dataloader)
-    avg_lb_loss = total_lb_loss / len(dataloader)
+    avg_spatial_lb_loss = total_spatial_lb_loss / len(dataloader)
+    avg_temporal_lb_loss = total_temporal_lb_loss / len(dataloader)
     accuracy = correct_predictions / total_samples
-    return avg_loss, avg_cls_loss, avg_lb_loss, accuracy
+    return avg_loss, avg_cls_loss, avg_spatial_lb_loss, avg_temporal_lb_loss, accuracy
+
 
 def validate(model, dataloader, criterion_cls, device):
     model.eval()
@@ -140,11 +90,13 @@ def validate(model, dataloader, criterion_cls, device):
     total_samples = 0
 
     with torch.no_grad():
-        for expert_clips, labels in tqdm(dataloader, desc="Validation"):
-            expert_clips_on_device = {k: v.to(device) for k, v in expert_clips.items()}
+        for expert_clips_nested, labels in tqdm(dataloader, desc="Validation"):
             labels = labels.to(device)
+            expert_clips_on_device = {}
+            for res_key, temporal_clips_dict in expert_clips_nested.items():
+                expert_clips_on_device[res_key] = {k: v.to(device) for k, v in temporal_clips_dict.items()}
 
-            logits, _ = model(expert_clips_on_device) # Gating weights not needed for validation loss
+            logits, _, _ = model(expert_clips_on_device)
 
             loss = criterion_cls(logits, labels)
             total_loss += loss.item()
@@ -157,108 +109,137 @@ def validate(model, dataloader, criterion_cls, device):
     accuracy = correct_predictions / total_samples
     return avg_loss, accuracy
 
+
 def main():
-    parser = argparse.ArgumentParser(description="MoE Temporal Sampling Action Recognition Training")
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="Path to the root data directory (e.g., data/KARD_video_organized)")
-    parser.add_argument("--dataset_name", type=str, required=True,
-                        help="Name of the dataset (e.g., KARD, UCF-101, HMDB-51)")
-    parser.add_argument("--num_frames", type=int, default=16,
-                        help="Number of frames per expert clip.")
-    parser.add_argument("--sampling_rates", type=int, nargs='+', default=[1, 2, 4, 8],
-                        help="Temporal sampling rates for experts (e.g., 1 2 4 8).")
-    parser.add_argument("--height", type=int, default=224, help="Frame height.")
-    parser.add_argument("--width", type=int, default=224, help="Frame width.")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for training.")
-    parser.add_argument("--num_epochs", type=int, default=30, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate.")
-    parser.add_argument("--lambda_lb", type=float, default=0.01,
-                        help="Coefficient for the load balancing loss.")
-    parser.add_argument("--weight_decay", type=float, default=1e-5,
-                        help="Weight decay (L2 penalty) for the optimizer.")
-    parser.add_argument("--dropout_prob", type=float, default=0.5,
-                        help="Dropout probability for the classifier head.")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of data loading workers.")
-    parser.add_argument("--save_dir", type=str, default="checkpoints",
-                        help="Directory to save model checkpoints.")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device to use for training (cuda or cpu).")
+    parser = argparse.ArgumentParser(description="Two-Tier MoE Action Recognition Training")
+    parser.add_argument("--config", type=str, required=True, help="Path to the YAML configuration file.")
+    # Add arguments for overriding specific config values, e.g., --batch_size, --learning_rate
+    # These should have default=None to easily check if they were provided.
+    parser.add_argument("--batch_size", type=int, default=None, help="Override batch size in config.")
+    parser.add_argument("--num_epochs", type=int, default=None, help="Override number of epochs in config.")
+    parser.add_argument("--learning_rate", type=float, default=None, help="Override learning rate in config.")
+    parser.add_argument("--resume_checkpoint", type=str, default=None, help="Override resume_checkpoint path in config.")
+
     args = parser.parse_args()
 
-    # Create save directory
-    os.makedirs(args.save_dir, exist_ok=True)
+    # Load config from YAML file
+    with open(args.config, 'r') as f:
+        cfg = yaml.safe_load(f)
 
-    print(f"Using device: {args.device}")
+    # --- Override config with command-line arguments if provided ---
+    if args.num_epochs is not None:
+        cfg['training']['num_epochs'] = args.num_epochs
+    if args.batch_size is not None:
+        cfg['training']['batch_size'] = args.batch_size
+    if args.learning_rate is not None:
+        cfg['training']['learning_rate'] = args.learning_rate
+    if args.resume_checkpoint is not None:
+        cfg['checkpoint']['resume_checkpoint'] = args.resume_checkpoint
 
-    # Data loading
-    train_data_path = os.path.join(args.data_dir, args.dataset_name, 'train')
-    val_data_path = os.path.join(args.data_dir, args.dataset_name, 'val') # Assuming a 'val' split
+    # --- Setup ---
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    save_dir = cfg['checkpoint']['save_dir']
+    os.makedirs(save_dir, exist_ok=True)
+
+    print("--- Configuration ---")
+    print(yaml.dump(cfg))
+    print("---------------------")
+    print(f"Using device: {device}")
+
+    # --- Data Loading ---
+    train_data_path = os.path.join(cfg['data']['data_dir'], cfg['data']['dataset_name'], 'train')
+    val_data_path = os.path.join(cfg['data']['data_dir'], cfg['data']['dataset_name'], 'val')
+
+    spatial_resolutions_tuples = tuple(tuple(res) for res in cfg['data']['spatial_resolutions'])
 
     train_dataset = VideoDataset(
         data_dir=train_data_path,
-        num_frames=args.num_frames,
-        temporal_sampling_rates=tuple(args.sampling_rates),
-        height=args.height, width=args.width, is_train=True
+        num_frames=cfg['data']['num_frames'],
+        temporal_sampling_rates=tuple(cfg['data']['temporal_sampling_rates']),
+        spatial_resolutions=spatial_resolutions_tuples,
+        is_train=True
     )
     val_dataset = VideoDataset(
         data_dir=val_data_path,
-        num_frames=args.num_frames,
-        temporal_sampling_rates=tuple(args.sampling_rates),
-        height=args.height, width=args.width, is_train=False
+        num_frames=cfg['data']['num_frames'],
+        temporal_sampling_rates=tuple(cfg['data']['temporal_sampling_rates']),
+        spatial_resolutions=spatial_resolutions_tuples,
+        is_train=False
     )
 
     train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, pin_memory=True
+        train_dataset, batch_size=cfg['training']['batch_size'], shuffle=True,
+        num_workers=cfg['data']['num_workers'], pin_memory=True
     )
     val_loader = DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.num_workers, pin_memory=True
+        val_dataset, batch_size=cfg['training']['batch_size'], shuffle=False,
+        num_workers=cfg['data']['num_workers'], pin_memory=True
     )
 
-    # Determine number of classes
     num_classes = len(train_dataset.class_to_idx)
     print(f"Number of classes: {num_classes}")
 
-    # Model, Loss, Optimizer
+    # --- Model, Loss, Optimizer ---
     model = MoEModel(
         num_classes=num_classes,
-        temporal_sampling_rates=tuple(args.sampling_rates),
-        dropout_prob=args.dropout_prob
-    ).to(args.device)
+        temporal_sampling_rates=tuple(cfg['data']['temporal_sampling_rates']),
+        spatial_resolutions=spatial_resolutions_tuples,
+        dropout_prob=cfg['model']['dropout_prob']
+    ).to(device)
+
     criterion_cls = nn.CrossEntropyLoss()
-    # For load balancing loss, we defined a helper function
-    criterion_lb = calculate_load_balancing_loss # Using the helper function directly
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    criterion_lb = calculate_load_balancing_loss
+    optimizer = optim.Adam(model.parameters(), lr=cfg['training']['learning_rate'], weight_decay=cfg['training']['weight_decay'])
 
+    # --- Resumption Logic ---
+    start_epoch = 1
     best_val_accuracy = -1.0
-    best_model_path = os.path.join(args.save_dir, "best_model.pth")
-    final_model_path = os.path.join(args.save_dir, "final_model.pth")
+    resume_checkpoint_path = cfg['checkpoint']['resume_checkpoint']
 
+    if resume_checkpoint_path and os.path.exists(resume_checkpoint_path):
+        print(f"Resuming training from checkpoint: {resume_checkpoint_path}")
+        checkpoint = torch.load(resume_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_accuracy = checkpoint.get('best_val_accuracy', -1.0)
+        print(f"Resumed from epoch {checkpoint['epoch']}, with best validation accuracy {best_val_accuracy:.4f}")
+    elif resume_checkpoint_path:
+        print(f"Warning: --resume_checkpoint path '{resume_checkpoint_path}' not found. Starting training from scratch.")
 
+    # --- Training Loop ---
     print("Starting training...")
-    for epoch in range(1, args.num_epochs + 1):
-        train_loss, train_cls_loss, train_lb_loss, train_accuracy = train(
-            model, train_loader, criterion_cls, criterion_lb, optimizer, args.device, args.lambda_lb
+    for epoch in range(start_epoch, cfg['training']['num_epochs'] + 1):
+        train_loss, train_cls_loss, train_spatial_lb_loss, train_temporal_lb_loss, train_accuracy = train(
+            model, train_loader, criterion_cls, criterion_lb, optimizer, device, cfg
         )
-        val_loss, val_accuracy = validate(
-            model, val_loader, criterion_cls, args.device
-        )
+        val_loss, val_accuracy = validate(model, val_loader, criterion_cls, device)
 
-        print(f"Epoch {epoch}/{args.num_epochs}:")
-        print(f"  Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, LB: {train_lb_loss:.4f}) | Train Acc: {train_accuracy:.4f}")
+        print(f"Epoch {epoch}/{cfg['training']['num_epochs']}:")
+        print(f"  Train Loss: {train_loss:.4f} (Cls: {train_cls_loss:.4f}, Spatial LB: {train_spatial_lb_loss:.4f}, Temporal LB: {train_temporal_lb_loss:.4f}) | Train Acc: {train_accuracy:.4f}")
         print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_accuracy:.4f}")
 
-        # Save best model based on validation accuracy
+        # --- Checkpoint Saving ---
+        best_model_path = os.path.join(save_dir, "best_model.pth")
+        latest_model_path = os.path.join(save_dir, "latest_model.pth")
+
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
             torch.save(model.state_dict(), best_model_path)
-            print(f"  Saved best model with Val Acc: {best_val_accuracy:.4f} to {best_model_path}")
+            print(f"  Saved new best model with Val Acc: {best_val_accuracy:.4f} to {best_model_path}")
 
-    # Save the final model
-    torch.save(model.state_dict(), final_model_path)
-    print(f"Training complete! Final model saved to {final_model_path}")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_val_accuracy': best_val_accuracy,
+            'config': cfg
+        }, latest_model_path)
+        print(f"  Saved latest checkpoint to {latest_model_path}")
+
+    print("\nTraining complete!")
+    print(f"Final best model saved to {best_model_path} with accuracy {best_val_accuracy:.4f}")
+    print(f"Latest checkpoint available at {latest_model_path}")
 
 if __name__ == "__main__":
     main()

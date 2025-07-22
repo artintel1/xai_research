@@ -1,0 +1,22 @@
+# Inference Parameters
+inference:
+  model_path: "checkpoints/best_model.pth" # Path to your trained model
+  video_path: "dataset/JHMDB_organized/train/clap/Kurt_Kr_mer_-_Klatschen_im_Flugzeug_clap_u_cm_np1_ri_bad_4.avi" # Default input video
+  output_path: "outputs/annotated_output_video4.mp4" # Default output video
+
+# Data Parameters (for preprocessing consistency with training)
+data:
+  data_dir_for_mapping: "dataset" # Points to the parent dir of your dataset_name_for_mapping
+  dataset_name_for_mapping: "KARD_video_organized" # Or "unified_dataset" if you created it
+  num_frames: 16
+  temporal_sampling_rates: [0, 1, 1, 1]
+  spatial_resolutions:
+    - [224, 224]
+    - [112, 112]
+    # - [56, 56] # Match your training config
+
+# Model architecture parameters needed to initialize the model (must match trained model)
+model:
+  dropout_prob: 0.5
+
+device: cuda

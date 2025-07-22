@@ -78,6 +78,7 @@ references/
 *.ipynb
 architecture_and_training_plan.md
 dataset
+unified_dataset
 # Model Checkpoints and Logs
 *.pt
 *.pth

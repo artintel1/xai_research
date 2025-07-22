@@ -1,0 +1,25 @@
+# Default Training Configuration for MoE Action Recognition Model
+
+# Data and Dataset Parameters
+data_dir: dataset
+dataset_name: KARD_video_organized
+num_frames: 16
+temporal_sampling_rates: [1, 2, 4, 8]
+spatial_resolutions: [224, 224, 112, 112, 56, 56]
+num_workers: 4
+
+# Training Hyperparameters
+batch_size: 4
+num_epochs: 20
+learning_rate: 0.0001
+weight_decay: 0.00001 # 1e-5
+
+# MoE Specific Parameters
+lambda_lb_spatial: 0.01
+lambda_lb_temporal: 0.01
+dropout_prob: 0.5
+
+# Checkpointing and Device
+save_dir: checkpoints
+resume_checkpoint: null # Set to 'checkpoints/rsm_model.pth' to resume
+device: cuda # Options: 'cuda' or 'cpu' (will be auto-detected if not specified)
